@@ -1,10 +1,10 @@
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
 st.set_page_config(page_title="Observational Accumulation Engine", layout="wide")
+
 
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
@@ -16,6 +16,7 @@ def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
         progress=False,
         threads=False,
     )
+
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -55,6 +56,7 @@ def find_base_window(df: pd.DataFrame, lookback: int = 120, min_window: int = 18
 
             pre = before.tail(min(30, len(before)))
             pre_return = float(pre["Close"].iloc[-1] / pre["Close"].iloc[0] - 1.0) if float(pre["Close"].iloc[0]) != 0 else 0.0
+
             width_score = 1.0 - min(rng / max(float(seg["Close"].mean()), 1e-9), 1.0)
             flat_score = 1.0 - min(abs(pre_return) * 3.0, 1.0)
             dur_score = min(len(seg) / max_window, 1.0)
@@ -76,6 +78,7 @@ def find_base_window(df: pd.DataFrame, lookback: int = 120, min_window: int = 18
                     "base_len": len(seg),
                     "score": float(score),
                 }
+
     return best
 
 
@@ -125,7 +128,13 @@ def compute_scores(df: pd.DataFrame, base: dict, zones: dict):
     base_seg = df.loc[base["start"]:base["end"]].copy()
 
     if len(post) < 5:
-        return {"accumulation": 50.0, "distribution": 50.0, "holding": 50.0, "release_risk": 50.0, "confidence": 35.0}
+        return {
+            "accumulation": 50.0,
+            "distribution": 50.0,
+            "holding": 50.0,
+            "release_risk": 50.0,
+            "confidence": 35.0,
+        }
 
     base_low = float(base["base_low"])
     base_high = float(base["base_high"])
@@ -195,8 +204,9 @@ WATCHLISTS = {
     "Mixed Default": ["AAPL", "NVDA", "BBCA.JK", "^JKSE", "GC=F", "EURUSD=X", "BTC-USD"],
 }
 
+st.set_page_config(page_title="Observational Accumulation / Distribution Engine", layout="wide")
 st.title("Observational Accumulation / Distribution Engine")
-st.caption("Versi tanpa Plotly. Fokus ke OHLCV + struktur, jadi lebih aman buat deploy di Streamlit Cloud.")
+st.caption("Versi tanpa Plotly. Fokus ke OHLCV + struktur.")
 
 with st.sidebar:
     mode = st.radio("Mode", ["Single Instrument", "Watchlist Scanner"])
@@ -237,23 +247,6 @@ if mode == "Single Instrument":
                 ["Confidence", round(res["confidence"], 1)],
             ], columns=["Field", "Value"])
             st.dataframe(info, use_container_width=True, hide_index=True)
-
-            notes = []
-            if res["accumulation"] >= 60:
-                notes.append("- Struktur lebih condong ke akumulasi.")
-            if res["distribution"] >= 60:
-                notes.append("- Struktur lebih condong ke distribusi.")
-            if res["holding"] >= 60:
-                notes.append("- Hasil markup masih relatif dibela.")
-            if res["release_risk"] >= 60:
-                notes.append("- Area penting mulai tidak dibela.")
-            if res["last_close"] >= res["avg_lower"] and res["last_close"] <= res["avg_upper"]:
-                notes.append("- Harga sedang masuk estimated average zone.")
-            if res["last_close"] < res["invalidation"]:
-                notes.append("- Harga di bawah invalidation zone, hipotesis bullish melemah.")
-            if not notes:
-                notes.append("- Belum ada edge yang cukup kuat. Struktur masih campur.")
-            st.markdown("\n".join(notes))
 else:
     preset = st.selectbox("Preset", list(WATCHLISTS.keys()))
     custom = st.text_area("Custom symbols (pisahkan koma)", value=", ".join(WATCHLISTS[preset]), height=100)
