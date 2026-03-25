@@ -23,15 +23,23 @@ import yfinance as yf
 # -----------------------------
 # Symbol universe presets
 # -----------------------------
+IHSG_WIDE = [
+    "^JKSE",
+    "BBCA.JK","BBRI.JK","BMRI.JK","BBNI.JK","TLKM.JK","ASII.JK","ICBP.JK","INDF.JK","CPIN.JK","SMGR.JK","UNTR.JK",
+    "ADRO.JK","PTBA.JK","ANTM.JK","MDKA.JK","TINS.JK","HRUM.JK","ITMG.JK","INDY.JK","PGEO.JK","MEDC.JK","AKRA.JK",
+    "AMMN.JK","BYAN.JK","TPIA.JK","BRPT.JK","ESSA.JK","SIDO.JK","KLBF.JK","MIKA.JK","HEAL.JK","SILO.JK","ACES.JK",
+    "MAPI.JK","MAPA.JK","ERAA.JK","EXCL.JK","ISAT.JK","MTEL.JK","GOTO.JK","BUKA.JK","BRIS.JK","ARTO.JK","BTPS.JK",
+    "BNGA.JK","NISP.JK","JPFA.JK","MAIN.JK","MYOR.JK","ULTJ.JK","INKP.JK","TKIM.JK","ICBP.JK","INKP.JK","TKIM.JK",
+    "PANI.JK","BREN.JK","NCKL.JK","MBMA.JK","AMRT.JK","RALS.JK","SCMA.JK","MNCN.JK","ADMR.JK","DOID.JK","DMAS.JK",
+    "PWON.JK","CTRA.JK","BSDE.JK","SMRA.JK","PWON.JK","WIKA.JK","PTPP.JK","JSMR.JK","WSKT.JK"
+]
+
 MARKET_PRESETS = {
     "US Mega + Liquid": [
         "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AMD","NFLX","AVGO","PLTR","JPM","XOM","LLY","COST","UNH",
         "SPY","QQQ","IWM","DIA"
     ],
-    "IHSG Leaders": [
-        "^JKSE","BBCA.JK","BBRI.JK","BMRI.JK","BBNI.JK","TLKM.JK","ASII.JK","ICBP.JK","AMMN.JK","BYAN.JK","GOTO.JK",
-        "TPIA.JK","CPIN.JK","INDF.JK","MDKA.JK","ADRO.JK","ANTM.JK","UNTR.JK","PTBA.JK","SMGR.JK"
-    ],
+    "IHSG Wide": IHSG_WIDE,
     "Forex Majors": [
         "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","NZDUSD=X","USDCAD=X","USDCHF=X","EURJPY=X","EURGBP=X","USDIDR=X"
     ],
@@ -54,7 +62,6 @@ MARKET_PRESETS = {
 def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
     symbol = symbol.strip().upper()
 
-    # Try history() first, then fallback to download()
     try:
         df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
     except Exception:
@@ -296,7 +303,62 @@ def compute_scores(df: pd.DataFrame, base: dict, zones: dict):
         "confidence": confidence,
         "invalidation": invalidation,
         "state": state,
+        "markup": float(markup),
+        "markdown": float(markdown),
+        "pre_return": float(pre_return),
+        "above_base": float(above_base),
+        "below_base": float(below_base),
     }
+
+
+def interpret_result(res: dict) -> dict:
+    state = res["state"]
+    strength = "weak"
+    lead_score = max(res["accumulation"], res["distribution"], res["holding"], res["release_risk"])
+
+    if lead_score >= 75 and res["confidence"] >= 60:
+        strength = "strong"
+    elif lead_score >= 62 and res["confidence"] >= 50:
+        strength = "moderate"
+
+    reasons = []
+    risks = []
+    action = ""
+
+    if state == "Accumulation Bias":
+        if res["pre_return"] < 0:
+            reasons.append("base terbentuk setelah tekanan turun sebelumnya")
+        if res["markup"] > 0:
+            reasons.append("harga sudah mampu keluar dari atas base")
+        if res["holding"] >= 60:
+            reasons.append("hasil markup masih relatif dibela")
+        if res["last_close"] >= res["avg_lower"] and res["last_close"] <= res["avg_upper"]:
+            reasons.append("harga sedang berada di area estimasi average")
+        risks.append("kalau close accepted di bawah invalidation, hipotesis bullish melemah")
+        if res["release_risk"] >= 55:
+            risks.append("ada tanda pertahanan area penting mulai berkurang")
+        action = "fokus cari apakah pullback masih ditahan di avg zone / defended zone"
+
+    elif state == "Distribution Bias":
+        if res["pre_return"] > 0:
+            reasons.append("base/range muncul setelah kenaikan sebelumnya")
+        if res["markdown"] > 0:
+            reasons.append("harga sudah kehilangan bagian bawah struktur")
+        if res["release_risk"] >= 60:
+            reasons.append("area penting tidak lagi dibela dengan baik")
+        if res["last_close"] < res["avg_lower"]:
+            reasons.append("harga berada di bawah average zone")
+        risks.append("kalau harga cepat reclaim avg zone dan bertahan di atasnya, bias bearish melemah")
+        action = "fokus lihat apakah bounce gagal reclaim avg zone / AVWAP"
+
+    else:
+        reasons.append("skor akumulasi dan distribusi belum cukup dominan")
+        reasons.append("struktur masih campur atau range belum resolve")
+        risks.append("breakout atau breakdown berikutnya akan lebih menentukan arah")
+        action = "jangan maksa baca arah; tunggu struktur lebih jelas"
+
+    summary = f"{state} ({strength})"
+    return {"summary": summary, "reasons": reasons, "risks": risks, "action": action}
 
 
 def analyze_symbol(symbol: str, period: str, interval: str):
@@ -316,6 +378,7 @@ def analyze_symbol(symbol: str, period: str, interval: str):
     result = {**base, **zones, **scores}
     result["last_close"] = float(df["Close"].iloc[-1])
     result["df"] = df
+    result["interpretation"] = interpret_result(result)
     return result, None
 
 
@@ -330,11 +393,10 @@ def scanner_table(symbols, period, interval):
             rows.append({
                 "Symbol": sym,
                 "State": res["state"],
-                "Accum / Dist": "ACCUM" if res["state"] == "Accumulation Bias" else ("DIST" if res["state"] == "Distribution Bias" else "MIXED"),
+                "Bias": "ACCUM" if res["state"] == "Accumulation Bias" else ("DIST" if res["state"] == "Distribution Bias" else "MIXED"),
+                "Interpretation": res["interpretation"]["summary"],
                 "Last Close": round(res["last_close"], 4),
                 "Avg Core": round(res["avg_core"], 4),
-                "Avg Lower": round(res["avg_lower"], 4),
-                "Avg Upper": round(res["avg_upper"], 4),
                 "Accumulation": round(res["accumulation"], 1),
                 "Distribution": round(res["distribution"], 1),
                 "Holding": round(res["holding"], 1),
@@ -358,7 +420,7 @@ def scanner_table(symbols, period, interval):
 # UI
 # -----------------------------
 st.title("Universal Observational Accumulation / Distribution Engine")
-st.caption("US stocks, IHSG, forex, futures/commodities, crypto. Universal untuk simbol Yahoo-compatible. Scanner sekarang jelas nunjukin ACCUM / DIST / MIXED.")
+st.caption("Interpretasi lebih manusiawi. Coverage lintas US stocks, IHSG, forex, futures/commodities, crypto. Scanner kasih bias ACCUM / DIST / MIXED dengan ringkasan.")
 
 with st.sidebar:
     mode = st.radio("Mode", ["Single Instrument", "Watchlist Scanner"])
@@ -389,6 +451,21 @@ if mode == "Single Instrument":
             i.metric("Defended Zone", f'{res["defend_low"]:.4f} - {res["defend_high"]:.4f}')
             j.metric("Invalidation", f'{res["invalidation"]:.4f}')
 
+            st.subheader("Interpretation")
+            st.write(res["interpretation"]["summary"])
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Kenapa engine baca begini**")
+                for x in res["interpretation"]["reasons"]:
+                    st.write("- " + x)
+            with col2:
+                st.markdown("**Risk / invalidation**")
+                for x in res["interpretation"]["risks"]:
+                    st.write("- " + x)
+                st.markdown("**Practical focus**")
+                st.write("- " + res["interpretation"]["action"])
+
             st.subheader("Close vs AVWAP")
             st.line_chart(res["df"][["Close", "AVWAP"]])
 
@@ -404,29 +481,13 @@ if mode == "Single Instrument":
             ], columns=["Field", "Value"])
             st.dataframe(info, use_container_width=True, hide_index=True)
 
-            notes = []
-            if res["state"] == "Accumulation Bias":
-                notes.append("- Struktur lebih condong ke akumulasi.")
-            elif res["state"] == "Distribution Bias":
-                notes.append("- Struktur lebih condong ke distribusi.")
-            else:
-                notes.append("- Struktur masih campur / netral.")
-
-            if res["last_close"] >= res["avg_lower"] and res["last_close"] <= res["avg_upper"]:
-                notes.append("- Harga sedang masuk estimated average zone.")
-            if res["holding"] >= 60:
-                notes.append("- Area hasil markup masih relatif dibela.")
-            if res["release_risk"] >= 60:
-                notes.append("- Ada tanda area penting mulai tidak dibela.")
-            st.markdown("\n".join(notes))
-
 else:
     preset = st.selectbox("Preset", list(MARKET_PRESETS.keys()))
     default_symbols = ", ".join(MARKET_PRESETS[preset])
     custom = st.text_area(
         "Symbols (pisahkan koma). Bisa campur US / IHSG / forex / futures / crypto.",
         value=default_symbols,
-        height=180
+        height=220
     )
 
     if st.button("Run Scanner", use_container_width=True):
@@ -441,9 +502,9 @@ else:
 
             st.subheader("Bias Summary")
             c1, c2, c3 = st.columns(3)
-            c1.metric("Accumulation Bias", int((out["Accum / Dist"] == "ACCUM").sum()))
-            c2.metric("Distribution Bias", int((out["Accum / Dist"] == "DIST").sum()))
-            c3.metric("Mixed", int((out["Accum / Dist"] == "MIXED").sum()))
+            c1.metric("Accumulation Bias", int((out["Bias"] == "ACCUM").sum()))
+            c2.metric("Distribution Bias", int((out["Bias"] == "DIST").sum()))
+            c3.metric("Mixed", int((out["Bias"] == "MIXED").sum()))
 
             csv = out.to_csv(index=False).encode("utf-8")
             st.download_button("Download CSV", data=csv, file_name="scanner_results.csv", mime="text/csv")
