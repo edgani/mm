@@ -1,9 +1,25 @@
-import numpy as np
-import pandas as pd
+import importlib.util
 import streamlit as st
-import yfinance as yf
 
 st.set_page_config(page_title="Observational Accumulation Engine", layout="wide")
+
+# Graceful dependency check so Streamlit Cloud shows a useful message
+_missing = [pkg for pkg in ["numpy", "pandas", "yfinance"] if importlib.util.find_spec(pkg) is None]
+if _missing:
+    st.error(
+        "Missing Python packages: " + ", ".join(_missing) + "\n\n"
+        "Put a file named requirements.txt in the SAME folder as app.py with:\n"
+        "streamlit>=1.36.0\n"
+        "pandas>=2.2.0\n"
+        "numpy>=1.26.0\n"
+        "yfinance>=0.2.54\n\n"
+        "Then redeploy / reboot the app."
+    )
+    st.stop()
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
 
 @st.cache_data(show_spinner=False, ttl=900)
@@ -16,7 +32,6 @@ def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
         progress=False,
         threads=False,
     )
-
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -55,7 +70,11 @@ def find_base_window(df: pd.DataFrame, lookback: int = 120, min_window: int = 18
             rng = max(seg_high - seg_low, 1e-9)
 
             pre = before.tail(min(30, len(before)))
-            pre_return = float(pre["Close"].iloc[-1] / pre["Close"].iloc[0] - 1.0) if float(pre["Close"].iloc[0]) != 0 else 0.0
+            pre_return = (
+                float(pre["Close"].iloc[-1] / pre["Close"].iloc[0] - 1.0)
+                if float(pre["Close"].iloc[0]) != 0
+                else 0.0
+            )
 
             width_score = 1.0 - min(rng / max(float(seg["Close"].mean()), 1e-9), 1.0)
             flat_score = 1.0 - min(abs(pre_return) * 3.0, 1.0)
@@ -142,7 +161,11 @@ def compute_scores(df: pd.DataFrame, base: dict, zones: dict):
     last_close = float(df["Close"].iloc[-1])
 
     pre = df.loc[:base["start"]].tail(25)
-    pre_return = float(pre["Close"].iloc[-1] / pre["Close"].iloc[0] - 1.0) if len(pre) >= 5 and float(pre["Close"].iloc[0]) != 0 else 0.0
+    pre_return = (
+        float(pre["Close"].iloc[-1] / pre["Close"].iloc[0] - 1.0)
+        if len(pre) >= 5 and float(pre["Close"].iloc[0]) != 0
+        else 0.0
+    )
 
     post_high = float(post["High"].max())
     post_low = float(post["Low"].min())
@@ -204,9 +227,9 @@ WATCHLISTS = {
     "Mixed Default": ["AAPL", "NVDA", "BBCA.JK", "^JKSE", "GC=F", "EURUSD=X", "BTC-USD"],
 }
 
-st.set_page_config(page_title="Observational Accumulation / Distribution Engine", layout="wide")
+
 st.title("Observational Accumulation / Distribution Engine")
-st.caption("Versi tanpa Plotly. Fokus ke OHLCV + struktur.")
+st.caption("Versi final tanpa Plotly. Fokus ke OHLCV + struktur.")
 
 with st.sidebar:
     mode = st.radio("Mode", ["Single Instrument", "Watchlist Scanner"])
@@ -247,6 +270,7 @@ if mode == "Single Instrument":
                 ["Confidence", round(res["confidence"], 1)],
             ], columns=["Field", "Value"])
             st.dataframe(info, use_container_width=True, hide_index=True)
+
 else:
     preset = st.selectbox("Preset", list(WATCHLISTS.keys()))
     custom = st.text_area("Custom symbols (pisahkan koma)", value=", ".join(WATCHLISTS[preset]), height=100)
