@@ -1,19 +1,17 @@
 import importlib.util
 import streamlit as st
 
-st.set_page_config(page_title="Observational Accumulation Engine", layout="wide")
+st.set_page_config(page_title="Universal Observational Market Engine", layout="wide")
 
-# Graceful dependency check so Streamlit Cloud shows a useful message
 _missing = [pkg for pkg in ["numpy", "pandas", "yfinance"] if importlib.util.find_spec(pkg) is None]
 if _missing:
     st.error(
         "Missing Python packages: " + ", ".join(_missing) + "\n\n"
-        "Put a file named requirements.txt in the SAME folder as app.py with:\n"
+        "Put requirements.txt in the SAME folder as app.py with:\n"
         "streamlit>=1.36.0\n"
         "pandas>=2.2.0\n"
         "numpy>=1.26.0\n"
-        "yfinance>=0.2.54\n\n"
-        "Then redeploy / reboot the app."
+        "yfinance>=0.2.54"
     )
     st.stop()
 
@@ -22,16 +20,59 @@ import pandas as pd
 import yfinance as yf
 
 
+# -----------------------------
+# Symbol universe presets
+# -----------------------------
+MARKET_PRESETS = {
+    "US Mega + Liquid": [
+        "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AMD","NFLX","AVGO","PLTR","JPM","XOM","LLY","COST","UNH",
+        "SPY","QQQ","IWM","DIA"
+    ],
+    "IHSG Leaders": [
+        "^JKSE","BBCA.JK","BBRI.JK","BMRI.JK","BBNI.JK","TLKM.JK","ASII.JK","ICBP.JK","AMMN.JK","BYAN.JK","GOTO.JK",
+        "TPIA.JK","CPIN.JK","INDF.JK","MDKA.JK","ADRO.JK","ANTM.JK","UNTR.JK","PTBA.JK","SMGR.JK"
+    ],
+    "Forex Majors": [
+        "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","NZDUSD=X","USDCAD=X","USDCHF=X","EURJPY=X","EURGBP=X","USDIDR=X"
+    ],
+    "Futures & Commodities": [
+        "GC=F","SI=F","CL=F","BZ=F","NG=F","HG=F","ZC=F","ZS=F","ZW=F","LE=F","HE=F","PL=F","PA=F"
+    ],
+    "Crypto Majors": [
+        "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD","DOGE-USD","AVAX-USD","LINK-USD","DOT-USD"
+    ],
+    "Mixed Global": [
+        "AAPL","NVDA","SPY","^JKSE","BBCA.JK","TLKM.JK","EURUSD=X","USDJPY=X","GC=F","CL=F","BTC-USD","ETH-USD"
+    ],
+}
+
+
+# -----------------------------
+# Data
+# -----------------------------
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    df = yf.download(
-        tickers=symbol.strip().upper(),
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
+    symbol = symbol.strip().upper()
+
+    # Try history() first, then fallback to download()
+    try:
+        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+    except Exception:
+        df = pd.DataFrame()
+
+    if df is None or df.empty:
+        try:
+            df = yf.download(
+                tickers=symbol,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception:
+            df = pd.DataFrame()
+
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -40,7 +81,11 @@ def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
 
     df = df.rename(columns=str.title)
     keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
-    df = df[keep].copy().dropna(subset=["Close"])
+    df = df[keep].copy()
+    if "Close" not in df.columns:
+        return pd.DataFrame()
+
+    df = df.dropna(subset=["Close"])
     return df
 
 
@@ -50,9 +95,12 @@ def safe_volume(df: pd.DataFrame) -> pd.Series:
     return pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
 
 
-def find_base_window(df: pd.DataFrame, lookback: int = 120, min_window: int = 18, max_window: int = 60):
+# -----------------------------
+# Engine
+# -----------------------------
+def find_base_window(df: pd.DataFrame, lookback: int = 150, min_window: int = 18, max_window: int = 70):
     d = df.tail(lookback).copy()
-    if len(d) < min_window + 5:
+    if len(d) < min_window + 8:
         return None
 
     best = None
@@ -68,24 +116,23 @@ def find_base_window(df: pd.DataFrame, lookback: int = 120, min_window: int = 18
             seg_high = float(seg["High"].max())
             seg_low = float(seg["Low"].min())
             rng = max(seg_high - seg_low, 1e-9)
+            seg_mean = max(float(seg["Close"].mean()), 1e-9)
 
             pre = before.tail(min(30, len(before)))
-            pre_return = (
-                float(pre["Close"].iloc[-1] / pre["Close"].iloc[0] - 1.0)
-                if float(pre["Close"].iloc[0]) != 0
-                else 0.0
-            )
+            pre_return = float(pre["Close"].iloc[-1] / pre["Close"].iloc[0] - 1.0) if float(pre["Close"].iloc[0]) != 0 else 0.0
 
-            width_score = 1.0 - min(rng / max(float(seg["Close"].mean()), 1e-9), 1.0)
+            width_score = 1.0 - min(rng / seg_mean, 1.0)
             flat_score = 1.0 - min(abs(pre_return) * 3.0, 1.0)
             dur_score = min(len(seg) / max_window, 1.0)
 
             lower_band = seg_low + 0.25 * rng
             upper_band = seg_high - 0.25 * rng
-            tests = int((seg["Low"] <= lower_band).sum()) + int((seg["High"] >= upper_band).sum())
-            test_score = min(tests / max(len(seg) * 0.30, 1), 1.0)
+            low_tests = int((seg["Low"] <= lower_band).sum())
+            high_tests = int((seg["High"] >= upper_band).sum())
+            test_score = min((low_tests + high_tests) / max(len(seg) * 0.30, 1), 1.0)
 
-            score = 0.35 * width_score + 0.20 * flat_score + 0.20 * dur_score + 0.25 * test_score
+            close_std = float(seg["Close"].pct_change().std() or 0.0)
+            score = 0.32 * width_score + 0.18 * flat_score + 0.18 * dur_score + 0.22 * test_score - 4.0 * close_std
 
             if score > best_score:
                 best_score = score
@@ -96,8 +143,9 @@ def find_base_window(df: pd.DataFrame, lookback: int = 120, min_window: int = 18
                     "base_high": seg_high,
                     "base_len": len(seg),
                     "score": float(score),
+                    "low_tests": low_tests,
+                    "high_tests": high_tests,
                 }
-
     return best
 
 
@@ -109,25 +157,29 @@ def estimate_zones(df: pd.DataFrame, base: dict):
 
     typical = (seg["High"] + seg["Low"] + seg["Close"]) / 3.0
     vol = safe_volume(seg)
-    vwap_center = float((typical * vol).sum() / vol.sum()) if float(vol.sum()) > 0 else float(typical.mean())
-    tp_center = float(typical.mean())
     midpoint = (base_high + base_low) / 2.0
+    tp_center = float(typical.mean())
+    vwap_center = float((typical * vol).sum() / vol.sum()) if float(vol.sum()) > 0 else tp_center
 
-    bins = np.linspace(base_low, base_high, 21)
+    bins = np.linspace(base_low, base_high, 25)
     hist, edges = np.histogram(seg["Close"].clip(base_low, base_high), bins=bins)
     ix = int(np.argmax(hist))
     defend_low = float(edges[max(ix - 1, 0)])
     defend_high = float(edges[min(ix + 2, len(edges) - 1)])
     defended_center = (defend_low + defend_high) / 2.0
 
-    avg_core = float(np.mean([midpoint, vwap_center, tp_center, defended_center]))
+    avg_core = float(np.mean([midpoint, tp_center, vwap_center, defended_center]))
     avg_half = 0.12 * base_range
 
     return {
+        "midpoint": midpoint,
+        "tp_center": tp_center,
+        "vwap_center": vwap_center,
         "defend_low": defend_low,
         "defend_high": defend_high,
-        "avg_core": avg_core,
+        "defended_center": defended_center,
         "avg_lower": avg_core - avg_half,
+        "avg_core": avg_core,
         "avg_upper": avg_core + avg_half,
     }
 
@@ -137,14 +189,15 @@ def anchored_vwap_from_base(df: pd.DataFrame, base: dict) -> pd.Series:
     typical = (seg["High"] + seg["Low"] + seg["Close"]) / 3.0
     vol = safe_volume(seg).replace(0, np.nan)
     avwap = (typical * vol).fillna(0).cumsum() / vol.fillna(0).cumsum().replace(0, np.nan)
+
     out = pd.Series(index=df.index, dtype=float)
     out.loc[seg.index] = avwap
     return out
 
 
 def compute_scores(df: pd.DataFrame, base: dict, zones: dict):
-    post = df.loc[base["end"]:].copy()
     base_seg = df.loc[base["start"]:base["end"]].copy()
+    post = df.loc[base["end"]:].copy()
 
     if len(post) < 5:
         return {
@@ -153,6 +206,7 @@ def compute_scores(df: pd.DataFrame, base: dict, zones: dict):
             "holding": 50.0,
             "release_risk": 50.0,
             "confidence": 35.0,
+            "state": "Neutral / Mixed",
         }
 
     base_low = float(base["base_low"])
@@ -161,102 +215,179 @@ def compute_scores(df: pd.DataFrame, base: dict, zones: dict):
     last_close = float(df["Close"].iloc[-1])
 
     pre = df.loc[:base["start"]].tail(25)
-    pre_return = (
-        float(pre["Close"].iloc[-1] / pre["Close"].iloc[0] - 1.0)
-        if len(pre) >= 5 and float(pre["Close"].iloc[0]) != 0
-        else 0.0
-    )
+    pre_return = float(pre["Close"].iloc[-1] / pre["Close"].iloc[0] - 1.0) if len(pre) >= 5 and float(pre["Close"].iloc[0]) != 0 else 0.0
 
     post_high = float(post["High"].max())
     post_low = float(post["Low"].min())
     markup = (post_high - base_high) / base_range
     markdown = (base_low - post_low) / base_range
+    above_base = (last_close - base_high) / base_range
+    below_base = (base_low - last_close) / base_range
+
     defended = 1.0 if last_close >= zones["avg_lower"] else 0.0
     above_avwap = 1.0 if not np.isnan(df["AVWAP"].iloc[-1]) and last_close >= float(df["AVWAP"].iloc[-1]) else 0.0
 
-    lower_rej = ((base_seg["Close"] - base_seg["Low"]) / (base_seg["High"] - base_seg["Low"]).replace(0, np.nan)).fillna(0).mean()
-    upper_rej = ((base_seg["High"] - base_seg["Close"]) / (base_seg["High"] - base_seg["Low"]).replace(0, np.nan)).fillna(0).mean()
+    body_range = (base_seg["High"] - base_seg["Low"]).replace(0, np.nan)
+    lower_rej = ((base_seg["Close"] - base_seg["Low"]) / body_range).fillna(0).mean()
+    upper_rej = ((base_seg["High"] - base_seg["Close"]) / body_range).fillna(0).mean()
 
-    accumulation = 25 + max(0.0, -pre_return) * 140 + max(0.0, markup) * 12 + defended * 12 + above_avwap * 8 + float(lower_rej) * 18 - max(0.0, markdown) * 15
-    distribution = 25 + max(0.0, pre_return) * 140 + max(0.0, markdown) * 14 + (1.0 if last_close < zones["avg_lower"] else 0.0) * 12 + (1.0 if not np.isnan(df["AVWAP"].iloc[-1]) and last_close < float(df["AVWAP"].iloc[-1]) else 0.0) * 8 + float(upper_rej) * 18 - max(0.0, markup) * 12
-    holding = 20 + max(0.0, (last_close - base_high) / base_range) * 20 + defended * 18 + above_avwap * 15
-    release_risk = 20 + max(0.0, (base_low - last_close) / base_range) * 22 + (1.0 if last_close < zones["avg_lower"] else 0.0) * 15 + (1.0 if not np.isnan(df["AVWAP"].iloc[-1]) and last_close < float(df["AVWAP"].iloc[-1]) else 0.0) * 10 - defended * 10
-    confidence = 35 + min(base["base_len"] / 60.0, 1.0) * 20 + min(base["score"], 1.0) * 20 + (15 if (safe_volume(df).tail(60) > 0).mean() > 0.6 else 6)
+    vol_valid = 1.0 if (safe_volume(df).tail(60) > 0).mean() > 0.60 else 0.4
+
+    accumulation = (
+        25
+        + max(0.0, -pre_return) * 140
+        + max(0.0, markup) * 12
+        + defended * 12
+        + above_avwap * 8
+        + float(lower_rej) * 18
+        - max(0.0, markdown) * 15
+    )
+
+    distribution = (
+        25
+        + max(0.0, pre_return) * 140
+        + max(0.0, markdown) * 14
+        + (1.0 if last_close < zones["avg_lower"] else 0.0) * 12
+        + (1.0 if not np.isnan(df["AVWAP"].iloc[-1]) and last_close < float(df["AVWAP"].iloc[-1]) else 0.0) * 8
+        + float(upper_rej) * 18
+        - max(0.0, markup) * 12
+    )
+
+    holding = (
+        20
+        + max(0.0, above_base) * 20
+        + defended * 18
+        + above_avwap * 15
+        - max(0.0, below_base) * 20
+    )
+
+    release_risk = (
+        20
+        + max(0.0, below_base) * 22
+        + (1.0 if last_close < zones["avg_lower"] else 0.0) * 15
+        + (1.0 if not np.isnan(df["AVWAP"].iloc[-1]) and last_close < float(df["AVWAP"].iloc[-1]) else 0.0) * 10
+        + max(0.0, markdown) * 10
+        - defended * 10
+    )
+
+    confidence = 35 + min(base["base_len"] / 70.0, 1.0) * 20 + min(base["score"], 1.0) * 20 + vol_valid * 15
 
     def clamp(x):
         return float(max(0.0, min(100.0, x)))
 
+    accumulation = clamp(accumulation)
+    distribution = clamp(distribution)
+    holding = clamp(holding)
+    release_risk = clamp(release_risk)
+    confidence = clamp(confidence)
+    invalidation = float(min(zones["avg_lower"], zones["defend_low"], base_low + 0.10 * base_range))
+
+    state = "Neutral / Mixed"
+    if accumulation >= 60 and holding >= 55:
+        state = "Accumulation Bias"
+    elif distribution >= 60 and release_risk >= 55:
+        state = "Distribution Bias"
+
     return {
-        "accumulation": clamp(accumulation),
-        "distribution": clamp(distribution),
-        "holding": clamp(holding),
-        "release_risk": clamp(release_risk),
-        "confidence": clamp(confidence),
-        "invalidation": float(min(zones["avg_lower"], zones["defend_low"], base_low + 0.10 * base_range)),
+        "accumulation": accumulation,
+        "distribution": distribution,
+        "holding": holding,
+        "release_risk": release_risk,
+        "confidence": confidence,
+        "invalidation": invalidation,
+        "state": state,
     }
-
-
-def classify(res: dict) -> str:
-    if res["accumulation"] >= 60 and res["holding"] >= 55:
-        return "Accumulation Bias"
-    if res["distribution"] >= 60 and res["release_risk"] >= 55:
-        return "Distribution Bias"
-    return "Neutral / Mixed"
 
 
 def analyze_symbol(symbol: str, period: str, interval: str):
     df = fetch_data(symbol, period, interval)
-    if df.empty or len(df) < 40:
-        return None, "Data kosong atau terlalu sedikit."
+    if df.empty or len(df) < 30:
+        return None, "Data kosong / terlalu sedikit / Yahoo tidak balikin data buat simbol ini."
+
     base = find_base_window(df)
     if not base:
-        return None, "Belum nemu base/range yang cukup jelas."
+        return None, "Belum ketemu base/range yang cukup jelas."
+
     zones = estimate_zones(df, base)
+    df = df.copy()
     df["AVWAP"] = anchored_vwap_from_base(df, base)
     scores = compute_scores(df, base, zones)
-    res = {**base, **zones, **scores, "last_close": float(df["Close"].iloc[-1]), "df": df}
-    return res, None
+
+    result = {**base, **zones, **scores}
+    result["last_close"] = float(df["Close"].iloc[-1])
+    result["df"] = df
+    return result, None
 
 
-WATCHLISTS = {
-    "US Mega Caps": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA"],
-    "IHSG Large Caps": ["BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK", "ASII.JK", "ICBP.JK"],
-    "Commodities & Futures": ["GC=F", "SI=F", "CL=F", "NG=F", "HG=F"],
-    "Forex": ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDIDR=X"],
-    "Crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD"],
-    "Mixed Default": ["AAPL", "NVDA", "BBCA.JK", "^JKSE", "GC=F", "EURUSD=X", "BTC-USD"],
-}
+def scanner_table(symbols, period, interval):
+    rows = []
+    progress = st.progress(0.0)
+
+    for i, sym in enumerate(symbols):
+        sym = sym.strip().upper()
+        res, err = analyze_symbol(sym, period, interval)
+        if res is not None:
+            rows.append({
+                "Symbol": sym,
+                "State": res["state"],
+                "Accum / Dist": "ACCUM" if res["state"] == "Accumulation Bias" else ("DIST" if res["state"] == "Distribution Bias" else "MIXED"),
+                "Last Close": round(res["last_close"], 4),
+                "Avg Core": round(res["avg_core"], 4),
+                "Avg Lower": round(res["avg_lower"], 4),
+                "Avg Upper": round(res["avg_upper"], 4),
+                "Accumulation": round(res["accumulation"], 1),
+                "Distribution": round(res["distribution"], 1),
+                "Holding": round(res["holding"], 1),
+                "Release Risk": round(res["release_risk"], 1),
+                "Confidence": round(res["confidence"], 1),
+            })
+        progress.progress((i + 1) / max(len(symbols), 1))
+
+    progress.empty()
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out["Bullish Edge"] = out["Accumulation"] * 0.40 + out["Holding"] * 0.35 + out["Confidence"] * 0.25 - out["Release Risk"] * 0.15
+    out["Bearish Edge"] = out["Distribution"] * 0.40 + out["Release Risk"] * 0.35 + out["Confidence"] * 0.25 - out["Holding"] * 0.15
+    out = out.sort_values(["Bullish Edge", "Confidence"], ascending=[False, False]).reset_index(drop=True)
+    return out
 
 
-st.title("Observational Accumulation / Distribution Engine")
-st.caption("Versi final tanpa Plotly. Fokus ke OHLCV + struktur.")
+# -----------------------------
+# UI
+# -----------------------------
+st.title("Universal Observational Accumulation / Distribution Engine")
+st.caption("US stocks, IHSG, forex, futures/commodities, crypto. Universal untuk simbol Yahoo-compatible. Scanner sekarang jelas nunjukin ACCUM / DIST / MIXED.")
 
 with st.sidebar:
     mode = st.radio("Mode", ["Single Instrument", "Watchlist Scanner"])
     period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=1)
     interval = st.selectbox("Interval", ["1d", "1wk", "1h"], index=0)
-    st.code("AAPL\nBBCA.JK\n^JKSE\nGC=F\nCL=F\nEURUSD=X\nBTC-USD", language=None)
+    st.markdown("### Contoh simbol")
+    st.code("AAPL\nBBCA.JK\n^JKSE\nEURUSD=X\nGC=F\nCL=F\nBTC-USD", language=None)
 
 if mode == "Single Instrument":
     symbol = st.text_input("Symbol", value="AAPL").strip().upper()
+
     if st.button("Analyze", use_container_width=True):
         res, err = analyze_symbol(symbol, period, interval)
         if err:
             st.error(err)
         else:
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("State", classify(res))
-            c2.metric("Accumulation", f'{res["accumulation"]:.1f}')
-            c3.metric("Distribution", f'{res["distribution"]:.1f}')
-            c4.metric("Holding", f'{res["holding"]:.1f}')
-            c5.metric("Release Risk", f'{res["release_risk"]:.1f}')
+            a,b,c,d,e = st.columns(5)
+            a.metric("State", res["state"])
+            b.metric("Accumulation", f'{res["accumulation"]:.1f}')
+            c.metric("Distribution", f'{res["distribution"]:.1f}')
+            d.metric("Holding", f'{res["holding"]:.1f}')
+            e.metric("Release Risk", f'{res["release_risk"]:.1f}')
 
-            c6, c7, c8, c9, c10 = st.columns(5)
-            c6.metric("Avg Core", f'{res["avg_core"]:.4f}')
-            c7.metric("Avg Lower", f'{res["avg_lower"]:.4f}')
-            c8.metric("Avg Upper", f'{res["avg_upper"]:.4f}')
-            c9.metric("Defended Zone", f'{res["defend_low"]:.4f} - {res["defend_high"]:.4f}')
-            c10.metric("Invalidation", f'{res["invalidation"]:.4f}')
+            f,g,h,i,j = st.columns(5)
+            f.metric("Avg Core", f'{res["avg_core"]:.4f}')
+            g.metric("Avg Lower", f'{res["avg_lower"]:.4f}')
+            h.metric("Avg Upper", f'{res["avg_upper"]:.4f}')
+            i.metric("Defended Zone", f'{res["defend_low"]:.4f} - {res["defend_high"]:.4f}')
+            j.metric("Invalidation", f'{res["invalidation"]:.4f}')
 
             st.subheader("Close vs AVWAP")
             st.line_chart(res["df"][["Close", "AVWAP"]])
@@ -267,40 +398,52 @@ if mode == "Single Instrument":
                 ["Base Low", round(res["base_low"], 4)],
                 ["Base High", round(res["base_high"], 4)],
                 ["Base Length", int(res["base_len"])],
+                ["Low Tests", int(res["low_tests"])],
+                ["High Tests", int(res["high_tests"])],
                 ["Confidence", round(res["confidence"], 1)],
             ], columns=["Field", "Value"])
             st.dataframe(info, use_container_width=True, hide_index=True)
 
+            notes = []
+            if res["state"] == "Accumulation Bias":
+                notes.append("- Struktur lebih condong ke akumulasi.")
+            elif res["state"] == "Distribution Bias":
+                notes.append("- Struktur lebih condong ke distribusi.")
+            else:
+                notes.append("- Struktur masih campur / netral.")
+
+            if res["last_close"] >= res["avg_lower"] and res["last_close"] <= res["avg_upper"]:
+                notes.append("- Harga sedang masuk estimated average zone.")
+            if res["holding"] >= 60:
+                notes.append("- Area hasil markup masih relatif dibela.")
+            if res["release_risk"] >= 60:
+                notes.append("- Ada tanda area penting mulai tidak dibela.")
+            st.markdown("\n".join(notes))
+
 else:
-    preset = st.selectbox("Preset", list(WATCHLISTS.keys()))
-    custom = st.text_area("Custom symbols (pisahkan koma)", value=", ".join(WATCHLISTS[preset]), height=100)
+    preset = st.selectbox("Preset", list(MARKET_PRESETS.keys()))
+    default_symbols = ", ".join(MARKET_PRESETS[preset])
+    custom = st.text_area(
+        "Symbols (pisahkan koma). Bisa campur US / IHSG / forex / futures / crypto.",
+        value=default_symbols,
+        height=180
+    )
+
     if st.button("Run Scanner", use_container_width=True):
         symbols = [x.strip().upper() for x in custom.split(",") if x.strip()]
-        rows = []
-        prog = st.progress(0.0)
-        for i, sym in enumerate(symbols):
-            res, err = analyze_symbol(sym, period, interval)
-            if res:
-                rows.append({
-                    "Symbol": sym,
-                    "State": classify(res),
-                    "Last Close": round(res["last_close"], 4),
-                    "Avg Core": round(res["avg_core"], 4),
-                    "Accumulation": round(res["accumulation"], 1),
-                    "Distribution": round(res["distribution"], 1),
-                    "Holding": round(res["holding"], 1),
-                    "Release Risk": round(res["release_risk"], 1),
-                    "Confidence": round(res["confidence"], 1),
-                })
-            prog.progress((i + 1) / max(len(symbols), 1))
-        prog.empty()
+        out = scanner_table(symbols, period, interval)
 
-        out = pd.DataFrame(rows)
         if out.empty:
-            st.warning("Belum ada hasil scan.")
+            st.warning("Belum ada hasil scan. Bisa jadi simbol tidak valid di Yahoo atau data terlalu sedikit.")
         else:
-            out["Bullish Edge"] = out["Accumulation"] * 0.40 + out["Holding"] * 0.35 + out["Confidence"] * 0.25 - out["Release Risk"] * 0.15
-            out["Bearish Edge"] = out["Distribution"] * 0.40 + out["Release Risk"] * 0.35 + out["Confidence"] * 0.25 - out["Holding"] * 0.15
-            out = out.sort_values("Bullish Edge", ascending=False).reset_index(drop=True)
+            st.subheader("Scanner Result")
             st.dataframe(out, use_container_width=True, hide_index=True)
-            st.download_button("Download CSV", out.to_csv(index=False).encode("utf-8"), "scanner_results.csv", "text/csv")
+
+            st.subheader("Bias Summary")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Accumulation Bias", int((out["Accum / Dist"] == "ACCUM").sum()))
+            c2.metric("Distribution Bias", int((out["Accum / Dist"] == "DIST").sum()))
+            c3.metric("Mixed", int((out["Accum / Dist"] == "MIXED").sum()))
+
+            csv = out.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", data=csv, file_name="scanner_results.csv", mime="text/csv")
