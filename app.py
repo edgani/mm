@@ -21,9 +21,6 @@ import pandas as pd
 import yfinance as yf
 
 
-# =========================================================
-# Config
-# =========================================================
 @dataclass
 class TacticalConfig:
     train_bars: int = 180
@@ -60,9 +57,6 @@ class V4Config:
     weekly_slow_ma: int = 40
 
 
-# =========================================================
-# Helpers
-# =========================================================
 def normalize_symbol(sym: str) -> str:
     return sym.strip().upper()
 
@@ -117,7 +111,6 @@ def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     low = df["Low"].astype(float)
     close = df["Close"].astype(float)
     prev_close = close.shift(1)
-
     tr = pd.concat(
         [
             (high - low).abs(),
@@ -126,7 +119,6 @@ def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
         ],
         axis=1,
     ).max(axis=1)
-
     return tr.rolling(length, min_periods=length).mean()
 
 
@@ -141,7 +133,6 @@ def weekly_trend_state(df: pd.DataFrame, fast_ma: int = 20, slow_ma: int = 40) -
     state.loc[bull] = "bullish"
     state.loc[bear] = "bearish"
     state = state.fillna("neutral")
-
     return state.reindex(df.index, method="ffill").fillna("neutral")
 
 
@@ -149,9 +140,6 @@ def normalize_score(x: float, low: float = 0.0, high: float = 100.0) -> float:
     return float(max(low, min(high, x)))
 
 
-# =========================================================
-# Data loading
-# =========================================================
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
     symbol = normalize_symbol(symbol)
@@ -226,9 +214,6 @@ def load_csv_ohlcv(uploaded_file) -> pd.DataFrame:
     return df[["Open", "High", "Low", "Close", "Volume"]].copy()
 
 
-# =========================================================
-# Feature engine
-# =========================================================
 class FeatureEngine:
     def __init__(self, cfg: V4Config):
         self.cfg = cfg
@@ -310,6 +295,7 @@ class FeatureEngine:
                     "low_tests": low_tests,
                     "high_tests": high_tests,
                     "setup_score": setup_score,
+                    "pre_return": pre_return,
                 }
         return best
 
@@ -317,7 +303,6 @@ class FeatureEngine:
         high = float(seg["High"].max())
         low = float(seg["Low"].min())
         seg_range = max(high - low, 1e-9)
-
         typical = (seg["High"] + seg["Low"] + seg["Close"]) / 3.0
         vol = safe_volume(seg)
 
@@ -397,6 +382,56 @@ class SignalEngine:
             return "B"
         return "C"
 
+    def accumulation_score(self, row: pd.Series, base: Dict, zone: Dict, avwap_value: float) -> float:
+        pretrend_down = 1.0 if base["pre_return"] < 0 else 0.4
+        breakout = 1.0 if row["Close"] > base["base_high"] else 0.0
+        above_avg = 1.0 if row["Close"] > zone["avg_core"] else 0.0
+        above_avwap = 1.0 if pd.notna(avwap_value) and row["Close"] > avwap_value else 0.0
+        base_quality = base["setup_score"] / 100.0
+        score = 100.0 * (
+            0.20 * pretrend_down +
+            0.25 * breakout +
+            0.20 * above_avg +
+            0.20 * above_avwap +
+            0.15 * base_quality
+        )
+        return normalize_score(score)
+
+    def distribution_score(self, row: pd.Series, base: Dict, zone: Dict, avwap_value: float) -> float:
+        pretrend_up = 1.0 if base["pre_return"] > 0 else 0.4
+        below_base = 1.0 if row["Close"] < base["base_low"] else 0.0
+        below_avg = 1.0 if row["Close"] < zone["avg_lower"] else 0.0
+        below_avwap = 1.0 if pd.notna(avwap_value) and row["Close"] < avwap_value else 0.0
+        weakness = 1.0 if row["Close"] < row.get("ma_50", row["Close"]) else 0.4
+        score = 100.0 * (
+            0.20 * pretrend_up +
+            0.25 * below_base +
+            0.20 * below_avg +
+            0.20 * below_avwap +
+            0.15 * weakness
+        )
+        return normalize_score(score)
+
+    def release_risk(self, row: pd.Series, zone: Dict, avwap_value: float) -> float:
+        below_avg = 1.0 if row["Close"] < zone["avg_lower"] else 0.0
+        below_avwap = 1.0 if pd.notna(avwap_value) and row["Close"] < avwap_value else 0.0
+        weekly_bad = 1.0 if row["weekly_state"] == "bearish" else (0.5 if row["weekly_state"] == "neutral" else 0.0)
+        atr_risk = float(row["ATR_pct_pctile"]) if pd.notna(row["ATR_pct_pctile"]) else 0.5
+        score = 100.0 * (
+            0.30 * below_avg +
+            0.30 * below_avwap +
+            0.20 * weekly_bad +
+            0.20 * atr_risk
+        )
+        return normalize_score(score)
+
+    def structure_state(self, accumulation_score: float, distribution_score: float, tactical_signal: str, runner_signal: str) -> str:
+        if (accumulation_score >= 60 and tactical_signal == "LONG") or runner_signal == "LONG":
+            return "Accumulation"
+        if distribution_score >= 60 and accumulation_score < 55:
+            return "Distribution"
+        return "Neutral / Mixed"
+
 
 def analyze_latest(df: pd.DataFrame, cfg: V4Config):
     feat = FeatureEngine(cfg)
@@ -405,7 +440,7 @@ def analyze_latest(df: pd.DataFrame, cfg: V4Config):
     d = feat.enrich(df)
     end_loc = len(d) - 1
     base = feat.detect_base(d, end_loc)
-    if not base:
+    if base is None:
         return None
 
     seg = d.loc[base["start_idx"]:base["end_idx"]].copy()
@@ -438,6 +473,11 @@ def analyze_latest(df: pd.DataFrame, cfg: V4Config):
         and final_rank >= cfg.runner.min_rank
     )
 
+    accumulation = sig.accumulation_score(row, base, zone, avwap_value)
+    distribution = sig.distribution_score(row, base, zone, avwap_value)
+    rel_risk = sig.release_risk(row, zone, avwap_value)
+    structure_state = sig.structure_state(accumulation, distribution, "LONG" if tactical_ok else "FLAT", "LONG" if runner_ok else "FLAT")
+
     return {
         "data": d,
         "base": base,
@@ -452,14 +492,15 @@ def analyze_latest(df: pd.DataFrame, cfg: V4Config):
         "tier": tier,
         "tactical_signal": "LONG" if tactical_ok else "FLAT",
         "runner_signal": "LONG" if runner_ok else "FLAT",
+        "accumulation_score": accumulation,
+        "distribution_score": distribution,
+        "release_risk": rel_risk,
+        "structure_state": structure_state,
     }
 
 
-# =========================================================
-# UI
-# =========================================================
 st.title("V4 Core Lane App")
-st.caption("Sekarang balik normal: bisa langsung pakai simbol, dan ada fallback upload CSV kalau perlu.")
+st.caption("Sekarang akumulasi dan distribusinya kelihatan jelas lagi, sambil tetap pakai logic V4.")
 
 with st.sidebar:
     st.header("Source")
@@ -470,7 +511,7 @@ with st.sidebar:
 
     if source_mode == "Live symbol":
         symbol = st.text_input("Symbol", value="AAPL")
-        st.code("AAPL\nHUMI\nBBCA\nEURUSD\nGC\nBTC", language=None)
+        st.code("AAPL\nBBCA\nHUMI\nEURUSD\nGC\nBTC", language=None)
         uploaded = None
     else:
         symbol = st.text_input("Symbol label", value="AAPL")
@@ -501,21 +542,26 @@ try:
         st.error("Belum ketemu base/range yang cukup jelas di latest window.")
         st.stop()
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Tactical", res["tactical_signal"])
-    c2.metric("Runner", res["runner_signal"])
-    c3.metric("Confidence", f'{res["confidence"]:.1f}')
-    c4.metric("Final Rank", f'{res["final_rank"]:.1f}')
+    a, b, c, d = st.columns(4)
+    a.metric("Structure State", res["structure_state"])
+    b.metric("Accumulation", f'{res["accumulation_score"]:.1f}')
+    c.metric("Distribution", f'{res["distribution_score"]:.1f}')
+    d.metric("Release Risk", f'{res["release_risk"]:.1f}')
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Tier", res["tier"])
-    c6.metric("Base High", f'{res["base"]["base_high"]:.4f}')
-    c7.metric("Avg Core", f'{res["zone"]["avg_core"]:.4f}')
-    c8.metric("AVWAP", f'{res["avwap_value"]:.4f}' if pd.notna(res["avwap_value"]) else "NA")
+    e, f, g, h = st.columns(4)
+    e.metric("Tactical", res["tactical_signal"])
+    f.metric("Runner", res["runner_signal"])
+    g.metric("Confidence", f'{res["confidence"]:.1f}')
+    h.metric("Final Rank", f'{res["final_rank"]:.1f}')
+
+    i, j, k, l = st.columns(4)
+    i.metric("Tier", res["tier"])
+    j.metric("Base High", f'{res["base"]["base_high"]:.4f}')
+    k.metric("Avg Core", f'{res["zone"]["avg_core"]:.4f}')
+    l.metric("AVWAP", f'{res["avwap_value"]:.4f}' if pd.notna(res["avwap_value"]) else "NA")
 
     st.subheader(f"{resolved_symbol} Close vs AVWAP")
-    chart_df = res["data"][["Close", "AVWAP"]].copy()
-    st.line_chart(chart_df)
+    st.line_chart(res["data"][["Close", "AVWAP"]])
 
     st.subheader("Scores")
     score_df = pd.DataFrame(
@@ -524,6 +570,9 @@ try:
             ["Confirmation Score", round(res["confirmation_score"], 2)],
             ["Hold Score", round(res["hold_score"], 2)],
             ["Regime Score", round(res["regime_score"], 2)],
+            ["Accumulation Score", round(res["accumulation_score"], 2)],
+            ["Distribution Score", round(res["distribution_score"], 2)],
+            ["Release Risk", round(res["release_risk"], 2)],
             ["Confidence", round(res["confidence"], 2)],
             ["Final Rank", round(res["final_rank"], 2)],
         ],
@@ -553,16 +602,22 @@ try:
 
     st.subheader("Interpretation")
     notes = []
+    if res["structure_state"] == "Accumulation":
+        notes.append("- Struktur saat ini lebih condong ke akumulasi.")
+    elif res["structure_state"] == "Distribution":
+        notes.append("- Struktur saat ini lebih condong ke distribusi / pelepasan barang.")
+    else:
+        notes.append("- Struktur saat ini masih netral / campur.")
+
     if res["tactical_signal"] == "LONG":
-        notes.append("- Tactical long valid: latest close lolos setup + confirmation minimum.")
+        notes.append("- Tactical long valid: breakout + avg core + AVWAP minimum sudah lolos.")
     else:
         notes.append("- Tactical long belum valid: masih kurang di breakout / avg core / AVWAP / score.")
     if res["runner_signal"] == "LONG":
-        notes.append("- Runner long valid: structure cukup kuat untuk horizon panjang.")
+        notes.append("- Runner long valid: structure cukup kuat untuk horizon lebih panjang.")
     else:
         notes.append("- Runner long belum valid: HTF / confidence / final rank belum cukup.")
-    weekly_state_now = res["data"]["weekly_state"].iloc[-1]
-    notes.append(f"- Weekly state sekarang: {weekly_state_now}.")
+    notes.append(f"- Weekly state sekarang: {res['data']['weekly_state'].iloc[-1]}.")
     st.markdown("\n".join(notes))
 
     with st.expander("Raw latest rows"):
