@@ -1,10 +1,25 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+
+import importlib.util
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+import streamlit as st
+
 st.set_page_config(page_title="V4 Core Lane App", layout="wide")
+
+_missing = [pkg for pkg in ["numpy", "pandas", "yfinance"] if importlib.util.find_spec(pkg) is None]
+if _missing:
+    st.error(
+        "Missing Python packages: " + ", ".join(_missing) + "\n\n"
+        "Put requirements.txt in the same folder as app.py with:\n"
+        "streamlit>=1.36.0\npandas>=2.2.0\nnumpy>=1.26.0\nyfinance>=0.2.54"
+    )
+    st.stop()
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
 
 # =========================================================
 # Config
@@ -45,6 +60,45 @@ class V4Config:
     weekly_slow_ma: int = 40
 
 
+# =========================================================
+# Helpers
+# =========================================================
+def normalize_symbol(sym: str) -> str:
+    return sym.strip().upper()
+
+
+def auto_resolve_symbol(sym: str, market_hint: str = "Auto"):
+    s = normalize_symbol(sym)
+    tries = []
+
+    if market_hint == "IHSG":
+        tries = [s if s.endswith(".JK") else s + ".JK", s]
+    elif market_hint == "US":
+        tries = [s]
+    elif market_hint == "Forex":
+        tries = [s if s.endswith("=X") else s + "=X", s]
+    elif market_hint == "Crypto":
+        tries = [s if "-USD" in s else s + "-USD", s]
+    elif market_hint == "Futures":
+        tries = [s if s.endswith("=F") else s + "=F", s]
+    else:
+        tries = [s]
+        if not s.endswith(".JK"):
+            tries.append(s + ".JK")
+        if not s.endswith("=X"):
+            tries.append(s + "=X")
+        if not s.endswith("=F"):
+            tries.append(s + "=F")
+        if "-USD" not in s:
+            tries.append(s + "-USD")
+
+    out = []
+    for x in tries:
+        if x not in out:
+            out.append(x)
+    return out
+
+
 def safe_volume(df: pd.DataFrame) -> pd.Series:
     if "Volume" not in df.columns:
         return pd.Series(index=df.index, data=0.0)
@@ -63,6 +117,7 @@ def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     low = df["Low"].astype(float)
     close = df["Close"].astype(float)
     prev_close = close.shift(1)
+
     tr = pd.concat(
         [
             (high - low).abs(),
@@ -71,6 +126,7 @@ def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
         ],
         axis=1,
     ).max(axis=1)
+
     return tr.rolling(length, min_periods=length).mean()
 
 
@@ -85,6 +141,7 @@ def weekly_trend_state(df: pd.DataFrame, fast_ma: int = 20, slow_ma: int = 40) -
     state.loc[bull] = "bullish"
     state.loc[bear] = "bearish"
     state = state.fillna("neutral")
+
     return state.reindex(df.index, method="ffill").fillna("neutral")
 
 
@@ -92,6 +149,86 @@ def normalize_score(x: float, low: float = 0.0, high: float = 100.0) -> float:
     return float(max(low, min(high, x)))
 
 
+# =========================================================
+# Data loading
+# =========================================================
+@st.cache_data(show_spinner=False, ttl=900)
+def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    symbol = normalize_symbol(symbol)
+
+    try:
+        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+    except Exception:
+        df = pd.DataFrame()
+
+    if df is None or df.empty:
+        try:
+            df = yf.download(
+                tickers=symbol,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception:
+            df = pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    df = df.rename(columns=str.title)
+    keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+    df = df[keep].copy()
+    if "Close" not in df.columns:
+        return pd.DataFrame()
+
+    df = df.dropna(subset=["Close"])
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+    return df[["Open", "High", "Low", "Close", "Volume"]].copy()
+
+
+def fetch_with_resolution(raw_symbol: str, period: str, interval: str, market_hint: str):
+    for candidate in auto_resolve_symbol(raw_symbol, market_hint):
+        df = fetch_data(candidate, period, interval)
+        if not df.empty and len(df) >= 30:
+            return candidate, df
+    return "", pd.DataFrame()
+
+
+def load_csv_ohlcv(uploaded_file) -> pd.DataFrame:
+    df = pd.read_csv(uploaded_file)
+    cols = {c.lower(): c for c in df.columns}
+    required = ["date", "open", "high", "low", "close"]
+    missing = [c for c in required if c not in cols]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    rename_map = {
+        cols["date"]: "Date",
+        cols["open"]: "Open",
+        cols["high"]: "High",
+        cols["low"]: "Low",
+        cols["close"]: "Close",
+    }
+    if "volume" in cols:
+        rename_map[cols["volume"]] = "Volume"
+
+    df = df.rename(columns=rename_map)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+    return df[["Open", "High", "Low", "Close", "Volume"]].copy()
+
+
+# =========================================================
+# Feature engine
+# =========================================================
 class FeatureEngine:
     def __init__(self, cfg: V4Config):
         self.cfg = cfg
@@ -100,8 +237,6 @@ class FeatureEngine:
         d = df.copy()
         d["ATR"] = compute_atr(d, self.cfg.atr_len)
         d["ATR_pct"] = d["ATR"] / d["Close"].replace(0, np.nan)
-        d["ret_20"] = d["Close"] / d["Close"].shift(20) - 1.0
-        d["ret_60"] = d["Close"] / d["Close"].shift(60) - 1.0
         d["vol_20"] = d["Close"].pct_change().rolling(self.cfg.vol_window).std()
         d["ATR_pct_pctile"] = rolling_percentile(d["ATR_pct"], self.cfg.percentile_window)
         d["vol_20_pctile"] = rolling_percentile(d["vol_20"], self.cfg.percentile_window)
@@ -116,6 +251,7 @@ class FeatureEngine:
         lookback = self.cfg.base_lookback
         min_len = self.cfg.base_min_len
         max_len = self.cfg.base_max_len
+
         start_loc = max(0, end_loc - lookback + 1)
         d = df.iloc[start_loc:end_loc + 1].copy()
         if len(d) < min_len + 8:
@@ -181,6 +317,7 @@ class FeatureEngine:
         high = float(seg["High"].max())
         low = float(seg["Low"].min())
         seg_range = max(high - low, 1e-9)
+
         typical = (seg["High"] + seg["Low"] + seg["Close"]) / 3.0
         vol = safe_volume(seg)
 
@@ -261,32 +398,6 @@ class SignalEngine:
         return "C"
 
 
-def load_csv_ohlcv(uploaded_file) -> pd.DataFrame:
-    df = pd.read_csv(uploaded_file)
-    cols = {c.lower(): c for c in df.columns}
-    required = ["date", "open", "high", "low", "close"]
-    missing = [c for c in required if c not in cols]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    rename_map = {
-        cols["date"]: "Date",
-        cols["open"]: "Open",
-        cols["high"]: "High",
-        cols["low"]: "Low",
-        cols["close"]: "Close",
-    }
-    if "volume" in cols:
-        rename_map[cols["volume"]] = "Volume"
-
-    df = df.rename(columns=rename_map)
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.set_index("Date").sort_index()
-    if "Volume" not in df.columns:
-        df["Volume"] = 0.0
-    return df[["Open", "High", "Low", "Close", "Volume"]].copy()
-
-
 def analyze_latest(df: pd.DataFrame, cfg: V4Config):
     feat = FeatureEngine(cfg)
     sig = SignalEngine(cfg)
@@ -344,96 +455,118 @@ def analyze_latest(df: pd.DataFrame, cfg: V4Config):
     }
 
 
+# =========================================================
+# UI
+# =========================================================
 st.title("V4 Core Lane App")
-st.caption("Sekarang ada isi. Upload CSV OHLCV lalu app bakal baca structure V4 buat latest bar.")
+st.caption("Sekarang balik normal: bisa langsung pakai simbol, dan ada fallback upload CSV kalau perlu.")
 
 with st.sidebar:
-    st.header("Config")
-    symbol = st.text_input("Symbol label", value="AAPL")
-    uploaded = st.file_uploader("Upload CSV OHLCV", type=["csv"])
-    st.markdown("CSV minimal:")
-    st.code("Date,Open,High,Low,Close,Volume", language=None)
+    st.header("Source")
+    source_mode = st.radio("Data source", ["Live symbol", "Upload CSV"])
+    market_hint = st.selectbox("Market hint", ["Auto", "US", "IHSG", "Forex", "Futures", "Crypto"], index=0)
+    period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=2)
+    interval = st.selectbox("Interval", ["1d", "1wk"], index=0)
+
+    if source_mode == "Live symbol":
+        symbol = st.text_input("Symbol", value="AAPL")
+        st.code("AAPL\nHUMI\nBBCA\nEURUSD\nGC\nBTC", language=None)
+        uploaded = None
+    else:
+        symbol = st.text_input("Symbol label", value="AAPL")
+        uploaded = st.file_uploader("Upload CSV OHLCV", type=["csv"])
+        st.code("Date,Open,High,Low,Close,Volume", language=None)
 
 cfg = V4Config()
 
-if uploaded is None:
-    st.info("Upload CSV dulu. File yang kemarin kosong karena yang dideploy itu module skeleton, bukan UI Streamlit.")
-else:
-    try:
+try:
+    resolved_symbol = symbol
+    if source_mode == "Live symbol":
+        resolved_symbol, df = fetch_with_resolution(symbol, period, interval, market_hint)
+        if df.empty:
+            st.error("Data kosong / simbol belum ke-resolve. Coba ganti market hint atau format simbol.")
+            st.stop()
+        st.success(f"Resolved symbol: {resolved_symbol}")
+    else:
+        if uploaded is None:
+            st.info("Upload CSV dulu kalau pakai mode CSV.")
+            st.stop()
         df = load_csv_ohlcv(uploaded)
-        if len(df) < 250:
-            st.warning(f"Data cuma {len(df)} bar. Lebih bagus >= 250 bar.")
-        res = analyze_latest(df, cfg)
-        if res is None:
-            st.error("Belum ketemu base/range yang cukup jelas di latest window.")
-        else:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Tactical", res["tactical_signal"])
-            c2.metric("Runner", res["runner_signal"])
-            c3.metric("Confidence", f'{res["confidence"]:.1f}')
-            c4.metric("Final Rank", f'{res["final_rank"]:.1f}')
 
-            c5, c6, c7, c8 = st.columns(4)
-            c5.metric("Tier", res["tier"])
-            c6.metric("Base High", f'{res["base"]["base_high"]:.4f}')
-            c7.metric("Avg Core", f'{res["zone"]["avg_core"]:.4f}')
-            c8.metric("AVWAP", f'{res["avwap_value"]:.4f}' if pd.notna(res["avwap_value"]) else "NA")
+    if len(df) < 250:
+        st.warning(f"Data cuma {len(df)} bar. Lebih bagus >= 250 bar.")
 
-            st.subheader(f"{symbol} Close vs AVWAP")
-            chart_df = res["data"][["Close", "AVWAP"]].copy()
-            st.line_chart(chart_df)
+    res = analyze_latest(df, cfg)
+    if res is None:
+        st.error("Belum ketemu base/range yang cukup jelas di latest window.")
+        st.stop()
 
-            st.subheader("Scores")
-            score_df = pd.DataFrame(
-                [
-                    ["Setup Score", round(res["setup_score"], 2)],
-                    ["Confirmation Score", round(res["confirmation_score"], 2)],
-                    ["Hold Score", round(res["hold_score"], 2)],
-                    ["Regime Score", round(res["regime_score"], 2)],
-                    ["Confidence", round(res["confidence"], 2)],
-                    ["Final Rank", round(res["final_rank"], 2)],
-                ],
-                columns=["Metric", "Value"],
-            )
-            st.dataframe(score_df, use_container_width=True, hide_index=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tactical", res["tactical_signal"])
+    c2.metric("Runner", res["runner_signal"])
+    c3.metric("Confidence", f'{res["confidence"]:.1f}')
+    c4.metric("Final Rank", f'{res["final_rank"]:.1f}')
 
-            st.subheader("Base / Zone Info")
-            base_df = pd.DataFrame(
-                [
-                    ["Base Start", str(res["base"]["start_idx"])],
-                    ["Base End", str(res["base"]["end_idx"])],
-                    ["Base Low", round(res["base"]["base_low"], 4)],
-                    ["Base High", round(res["base"]["base_high"], 4)],
-                    ["Compression", round(res["base"]["compression"], 4)],
-                    ["Low Tests", int(res["base"]["low_tests"])],
-                    ["High Tests", int(res["base"]["high_tests"])],
-                    ["Avg Lower", round(res["zone"]["avg_lower"], 4)],
-                    ["Avg Core", round(res["zone"]["avg_core"], 4)],
-                    ["Avg Upper", round(res["zone"]["avg_upper"], 4)],
-                    ["Defend Low", round(res["zone"]["defend_low"], 4)],
-                    ["Defend High", round(res["zone"]["defend_high"], 4)],
-                ],
-                columns=["Field", "Value"],
-            )
-            st.dataframe(base_df, use_container_width=True, hide_index=True)
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Tier", res["tier"])
+    c6.metric("Base High", f'{res["base"]["base_high"]:.4f}')
+    c7.metric("Avg Core", f'{res["zone"]["avg_core"]:.4f}')
+    c8.metric("AVWAP", f'{res["avwap_value"]:.4f}' if pd.notna(res["avwap_value"]) else "NA")
 
-            st.subheader("Interpretation")
-            notes = []
-            if res["tactical_signal"] == "LONG":
-                notes.append("- Tactical long valid: latest close lolos setup + confirmation minimum.")
-            else:
-                notes.append("- Tactical long belum valid: masih kurang di breakout / avg core / AVWAP / score.")
-            if res["runner_signal"] == "LONG":
-                notes.append("- Runner long valid: structure cukup kuat untuk horizon panjang.")
-            else:
-                notes.append("- Runner long belum valid: HTF / confidence / final rank belum cukup.")
-            if res["data"]["weekly_state"].iloc[-1] == "bullish":
-                notes.append("- Weekly state bullish.")
-            else:
-                notes.append(f"- Weekly state sekarang {res['data']['weekly_state'].iloc[-1]}.")
-            st.markdown("\n".join(notes))
+    st.subheader(f"{resolved_symbol} Close vs AVWAP")
+    chart_df = res["data"][["Close", "AVWAP"]].copy()
+    st.line_chart(chart_df)
 
-            with st.expander("Raw latest rows"):
-                st.dataframe(res["data"].tail(30), use_container_width=True)
-    except Exception as e:
-        st.error(f"Error: {e}")
+    st.subheader("Scores")
+    score_df = pd.DataFrame(
+        [
+            ["Setup Score", round(res["setup_score"], 2)],
+            ["Confirmation Score", round(res["confirmation_score"], 2)],
+            ["Hold Score", round(res["hold_score"], 2)],
+            ["Regime Score", round(res["regime_score"], 2)],
+            ["Confidence", round(res["confidence"], 2)],
+            ["Final Rank", round(res["final_rank"], 2)],
+        ],
+        columns=["Metric", "Value"],
+    )
+    st.dataframe(score_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Base / Zone Info")
+    base_df = pd.DataFrame(
+        [
+            ["Base Start", str(res["base"]["start_idx"])],
+            ["Base End", str(res["base"]["end_idx"])],
+            ["Base Low", round(res["base"]["base_low"], 4)],
+            ["Base High", round(res["base"]["base_high"], 4)],
+            ["Compression", round(res["base"]["compression"], 4)],
+            ["Low Tests", int(res["base"]["low_tests"])],
+            ["High Tests", int(res["base"]["high_tests"])],
+            ["Avg Lower", round(res["zone"]["avg_lower"], 4)],
+            ["Avg Core", round(res["zone"]["avg_core"], 4)],
+            ["Avg Upper", round(res["zone"]["avg_upper"], 4)],
+            ["Defend Low", round(res["zone"]["defend_low"], 4)],
+            ["Defend High", round(res["zone"]["defend_high"], 4)],
+        ],
+        columns=["Field", "Value"],
+    )
+    st.dataframe(base_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Interpretation")
+    notes = []
+    if res["tactical_signal"] == "LONG":
+        notes.append("- Tactical long valid: latest close lolos setup + confirmation minimum.")
+    else:
+        notes.append("- Tactical long belum valid: masih kurang di breakout / avg core / AVWAP / score.")
+    if res["runner_signal"] == "LONG":
+        notes.append("- Runner long valid: structure cukup kuat untuk horizon panjang.")
+    else:
+        notes.append("- Runner long belum valid: HTF / confidence / final rank belum cukup.")
+    weekly_state_now = res["data"]["weekly_state"].iloc[-1]
+    notes.append(f"- Weekly state sekarang: {weekly_state_now}.")
+    st.markdown("\n".join(notes))
+
+    with st.expander("Raw latest rows"):
+        st.dataframe(res["data"].tail(30), use_container_width=True)
+
+except Exception as e:
+    st.error(f"Error: {e}")
