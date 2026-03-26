@@ -1,25 +1,14 @@
-"""
-V4 Core Lane Skeleton (fixed)
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
+import streamlit as st
 import pandas as pd
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
+st.set_page_config(page_title="V4 Core Lane App", layout="wide")
 
 # =========================================================
 # Config
 # =========================================================
-@dataclass
-class UniverseConfig:
-    symbols: List[str]
-
-
 @dataclass
 class TacticalConfig:
     train_bars: int = 180
@@ -56,9 +45,6 @@ class V4Config:
     weekly_slow_ma: int = 40
 
 
-# =========================================================
-# Helpers
-# =========================================================
 def safe_volume(df: pd.DataFrame) -> pd.Series:
     if "Volume" not in df.columns:
         return pd.Series(index=df.index, data=0.0)
@@ -77,7 +63,6 @@ def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     low = df["Low"].astype(float)
     close = df["Close"].astype(float)
     prev_close = close.shift(1)
-
     tr = pd.concat(
         [
             (high - low).abs(),
@@ -86,7 +71,6 @@ def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
         ],
         axis=1,
     ).max(axis=1)
-
     return tr.rolling(length, min_periods=length).mean()
 
 
@@ -101,18 +85,13 @@ def weekly_trend_state(df: pd.DataFrame, fast_ma: int = 20, slow_ma: int = 40) -
     state.loc[bull] = "bullish"
     state.loc[bear] = "bearish"
     state = state.fillna("neutral")
-
-    aligned = state.reindex(df.index, method="ffill")
-    return aligned.fillna("neutral")
+    return state.reindex(df.index, method="ffill").fillna("neutral")
 
 
 def normalize_score(x: float, low: float = 0.0, high: float = 100.0) -> float:
     return float(max(low, min(high, x)))
 
 
-# =========================================================
-# Feature Engine
-# =========================================================
 class FeatureEngine:
     def __init__(self, cfg: V4Config):
         self.cfg = cfg
@@ -137,7 +116,6 @@ class FeatureEngine:
         lookback = self.cfg.base_lookback
         min_len = self.cfg.base_min_len
         max_len = self.cfg.base_max_len
-
         start_loc = max(0, end_loc - lookback + 1)
         d = df.iloc[start_loc:end_loc + 1].copy()
         if len(d) < min_len + 8:
@@ -197,14 +175,12 @@ class FeatureEngine:
                     "high_tests": high_tests,
                     "setup_score": setup_score,
                 }
-
         return best
 
     def estimate_avg_zone(self, seg: pd.DataFrame) -> Dict:
         high = float(seg["High"].max())
         low = float(seg["Low"].min())
         seg_range = max(high - low, 1e-9)
-
         typical = (seg["High"] + seg["Low"] + seg["Close"]) / 3.0
         vol = safe_volume(seg)
 
@@ -235,15 +211,11 @@ class FeatureEngine:
         typical = (seg["High"] + seg["Low"] + seg["Close"]) / 3.0
         vol = safe_volume(seg).replace(0, np.nan)
         avwap = (typical * vol).fillna(0).cumsum() / vol.fillna(0).cumsum().replace(0, np.nan)
-
         out = pd.Series(index=df.index, dtype=float)
         out.loc[seg.index] = avwap
         return out
 
 
-# =========================================================
-# Signal Engine
-# =========================================================
 class SignalEngine:
     def __init__(self, cfg: V4Config):
         self.cfg = cfg
@@ -256,56 +228,28 @@ class SignalEngine:
         above_avg_core = 1.0 if row["Close"] > zone["avg_core"] else 0.0
         above_avwap = 1.0 if pd.notna(avwap_value) and row["Close"] > avwap_value else 0.0
         breakout_distance_quality = 1.0 if row["Close"] <= zone["avg_upper"] else 0.6
-
-        score = 100.0 * (
-            0.35 * breakout_confirm +
-            0.25 * above_avg_core +
-            0.25 * above_avwap +
-            0.15 * breakout_distance_quality
-        )
-        return normalize_score(score)
+        return normalize_score(100.0 * (0.35 * breakout_confirm + 0.25 * above_avg_core + 0.25 * above_avwap + 0.15 * breakout_distance_quality))
 
     def hold_score(self, row: pd.Series, zone: Dict, avwap_value: float) -> float:
         above_avg_lower = 1.0 if row["Close"] >= zone["avg_lower"] else 0.0
         above_avwap = 1.0 if pd.notna(avwap_value) and row["Close"] >= avwap_value else 0.0
         reclaim_quality = 1.0 if row["Close"] >= zone["avg_core"] else 0.5
         trend_integrity = 1.0 if row["Close"] >= row.get("ma_50", row["Close"]) else 0.5
+        return normalize_score(100.0 * (0.30 * above_avg_lower + 0.30 * above_avwap + 0.20 * reclaim_quality + 0.20 * trend_integrity))
 
-        score = 100.0 * (
-            0.30 * above_avg_lower +
-            0.30 * above_avwap +
-            0.20 * reclaim_quality +
-            0.20 * trend_integrity
-        )
-        return normalize_score(score)
-
-    def regime_score(self, row: pd.Series, zone: Dict, base: Dict) -> float:
+    def regime_score(self, row: pd.Series, zone: Dict) -> float:
         atr_ok = 1.0 if pd.notna(row["ATR_pct_pctile"]) and row["ATR_pct_pctile"] <= 0.85 else 0.3
         vol_ok = 1.0 if pd.notna(row["vol_20_pctile"]) and row["vol_20_pctile"] <= 0.85 else 0.4
         weekly_trend_ok = 1.0 if row["weekly_state"] == "bullish" else (0.5 if row["weekly_state"] == "neutral" else 0.0)
-
         atr = row.get("ATR", np.nan)
         distance_from_avg_atr = 0.0
         if pd.notna(atr) and atr > 0:
             distance_from_avg_atr = max((row["Close"] - zone["avg_core"]) / atr, 0.0)
-
         extension_penalty = min(distance_from_avg_atr / 4.0, 1.0)
-        score = 100.0 * (
-            0.35 * atr_ok +
-            0.25 * vol_ok +
-            0.25 * weekly_trend_ok +
-            0.15 * (1.0 - extension_penalty)
-        )
-        return normalize_score(score)
+        return normalize_score(100.0 * (0.35 * atr_ok + 0.25 * vol_ok + 0.25 * weekly_trend_ok + 0.15 * (1.0 - extension_penalty)))
 
     def final_rank(self, setup_score: float, confirmation_score: float, hold_score: float, regime_score: float) -> float:
-        rank = (
-            0.30 * setup_score +
-            0.30 * confirmation_score +
-            0.25 * hold_score +
-            0.15 * regime_score
-        )
-        return normalize_score(rank)
+        return normalize_score(0.30 * setup_score + 0.30 * confirmation_score + 0.25 * hold_score + 0.15 * regime_score)
 
     def tier(self, rank: float) -> str:
         if rank >= 80:
@@ -316,289 +260,22 @@ class SignalEngine:
             return "B"
         return "C"
 
-    def tactical_long_signal(self, row: pd.Series, base: Dict, zone: Dict, avwap_value: float, confidence: float, final_rank: float) -> bool:
-        atr = row.get("ATR", np.nan)
-        distance_from_avg_atr = np.inf
-        if pd.notna(atr) and atr > 0:
-            distance_from_avg_atr = (row["Close"] - zone["avg_core"]) / atr
 
-        if row["Close"] <= base["base_high"]:
-            return False
-        if row["Close"] <= zone["avg_core"]:
-            return False
-        if pd.isna(avwap_value) or row["Close"] <= avwap_value:
-            return False
-        if confidence < self.cfg.tactical.min_confidence:
-            return False
-        if pd.notna(row["ATR_pct_pctile"]) and row["ATR_pct_pctile"] > self.cfg.tactical.max_atr_percentile:
-            return False
-        if distance_from_avg_atr > self.cfg.tactical.max_distance_from_avg_atr:
-            return False
-        if row["weekly_state"] == "bearish":
-            return False
-        if final_rank < self.cfg.tactical.min_rank:
-            return False
-        return True
-
-    def runner_long_signal(self, row: pd.Series, base: Dict, zone: Dict, avwap_value: float, confidence: float, final_rank: float) -> bool:
-        atr = row.get("ATR", np.nan)
-        distance_from_base_atr = np.inf
-        if pd.notna(atr) and atr > 0:
-            distance_from_base_atr = (row["Close"] - base["base_high"]) / atr
-
-        if not self.tactical_long_signal(row, base, zone, avwap_value, confidence, final_rank):
-            return False
-        if row["weekly_state"] != "bullish":
-            return False
-        if distance_from_base_atr > self.cfg.runner.max_distance_from_base_atr:
-            return False
-        if confidence < self.cfg.runner.min_confidence:
-            return False
-        if final_rank < self.cfg.runner.min_rank:
-            return False
-        return True
-
-    def tactical_exit(self, row: pd.Series, zone: Dict, avwap_value: float) -> bool:
-        if row["Close"] < zone["avg_lower"]:
-            return True
-        if pd.notna(avwap_value) and row["Close"] < avwap_value:
-            return True
-        return False
-
-    def runner_exit(self, row: pd.Series, zone: Dict, avwap_value: float) -> bool:
-        if row["weekly_state"] == "bearish":
-            return True
-        if row["Close"] < zone["avg_lower"] and pd.notna(avwap_value) and row["Close"] < avwap_value:
-            return True
-        return False
-
-    def confidence(self, setup_score: float, confirmation_score: float, hold_score: float, regime_score: float) -> float:
-        conf = 0.25 * setup_score + 0.35 * confirmation_score + 0.25 * hold_score + 0.15 * regime_score
-        return normalize_score(conf)
-
-
-# =========================================================
-# Risk Engine
-# =========================================================
-class RiskEngine:
-    def size_from_tier(self, tier: str, atr_pct_pctile: float, vol_pctile: float) -> float:
-        if tier == "A+":
-            size = 1.0
-        elif tier == "A":
-            size = 0.75
-        elif tier == "B":
-            size = 0.50
-        else:
-            size = 0.0
-
-        if pd.notna(atr_pct_pctile) and atr_pct_pctile > 0.85:
-            size *= 0.5
-        if pd.notna(vol_pctile) and vol_pctile > 0.85:
-            size *= 0.5
-
-        return float(size)
-
-    def no_trade_filter(self, confidence: float, final_rank: float, weekly_state: str) -> bool:
-        if confidence < 60:
-            return True
-        if final_rank < 70:
-            return True
-        if weekly_state == "bearish":
-            return True
-        return False
-
-
-# =========================================================
-# Backtest Engine
-# =========================================================
-class BacktestEngine:
-    def __init__(self, cfg: V4Config):
-        self.cfg = cfg
-        self.features = FeatureEngine(cfg)
-        self.signals = SignalEngine(cfg)
-        self.risk = RiskEngine()
-
-    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
-        return self.features.enrich(df)
-
-    def _compute_snapshot(self, d: pd.DataFrame, end_loc: int) -> Optional[Dict]:
-        base = self.features.detect_base(d, end_loc)
-        if not base:
-            return None
-
-        seg = d.loc[base["start_idx"]:base["end_idx"]].copy()
-        zone = self.features.estimate_avg_zone(seg)
-        d = d.copy()
-        d["AVWAP"] = self.features.anchored_vwap(d, base["start_idx"])
-
-        row = d.iloc[end_loc]
-        avwap_value = d["AVWAP"].iloc[end_loc]
-
-        setup_score = self.signals.setup_score(base)
-        confirmation_score = self.signals.confirmation_score(row, base, zone, avwap_value)
-        hold_score = self.signals.hold_score(row, zone, avwap_value)
-        regime_score = self.signals.regime_score(row, zone, base)
-        confidence = self.signals.confidence(setup_score, confirmation_score, hold_score, regime_score)
-        final_rank = self.signals.final_rank(setup_score, confirmation_score, hold_score, regime_score)
-        tier = self.signals.tier(final_rank)
-        size = self.risk.size_from_tier(tier, row.get("ATR_pct_pctile", np.nan), row.get("vol_20_pctile", np.nan))
-
-        return {
-            "base": base,
-            "zone": zone,
-            "row": row,
-            "avwap": avwap_value,
-            "setup_score": setup_score,
-            "confirmation_score": confirmation_score,
-            "hold_score": hold_score,
-            "regime_score": regime_score,
-            "confidence": confidence,
-            "final_rank": final_rank,
-            "tier": tier,
-            "size": size,
-            "data": d,
-        }
-
-    def run_tactical_walk_forward(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-        d = self.prepare(df)
-        rows = []
-        max_h = max(self.cfg.tactical.forward_bars)
-
-        for end_loc in range(self.cfg.tactical.train_bars, len(d) - max_h, self.cfg.tactical.step_bars):
-            snap = self._compute_snapshot(d.iloc[: end_loc + 1].copy(), end_loc)
-            if not snap:
-                continue
-
-            row = snap["row"]
-            signal = self.signals.tactical_long_signal(
-                row=row,
-                base=snap["base"],
-                zone=snap["zone"],
-                avwap_value=snap["avwap"],
-                confidence=snap["confidence"],
-                final_rank=snap["final_rank"],
-            )
-
-            trade = "FLAT"
-            if signal and not self.risk.no_trade_filter(snap["confidence"], snap["final_rank"], row["weekly_state"]):
-                trade = "LONG"
-
-            entry_close = float(d["Close"].iloc[end_loc])
-
-            out = {
-                "symbol": symbol,
-                "module": "TACTICAL",
-                "signal_date": d.index[end_loc],
-                "signal": trade,
-                "confidence": snap["confidence"],
-                "final_rank": snap["final_rank"],
-                "tier": snap["tier"],
-                "size": snap["size"],
-                "entry_close": entry_close,
-            }
-
-            for h in self.cfg.tactical.forward_bars:
-                exit_close = float(d["Close"].iloc[end_loc + h])
-                raw_ret = exit_close / entry_close - 1.0
-                strat_ret = raw_ret * snap["size"] if trade == "LONG" else 0.0
-                out[f"ret_{h}"] = raw_ret
-                out[f"strat_ret_{h}"] = strat_ret
-
-            rows.append(out)
-
-        return pd.DataFrame(rows)
-
-    def run_runner_walk_forward(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-        d = self.prepare(df)
-        rows = []
-        max_h = max(self.cfg.runner.forward_bars)
-
-        for end_loc in range(self.cfg.runner.train_bars, len(d) - max_h, self.cfg.runner.step_bars):
-            snap = self._compute_snapshot(d.iloc[: end_loc + 1].copy(), end_loc)
-            if not snap:
-                continue
-
-            row = snap["row"]
-            signal = self.signals.runner_long_signal(
-                row=row,
-                base=snap["base"],
-                zone=snap["zone"],
-                avwap_value=snap["avwap"],
-                confidence=snap["confidence"],
-                final_rank=snap["final_rank"],
-            )
-
-            trade = "FLAT"
-            if signal and not self.risk.no_trade_filter(snap["confidence"], snap["final_rank"], row["weekly_state"]):
-                trade = "LONG"
-
-            entry_close = float(d["Close"].iloc[end_loc])
-
-            out = {
-                "symbol": symbol,
-                "module": "RUNNER",
-                "signal_date": d.index[end_loc],
-                "signal": trade,
-                "confidence": snap["confidence"],
-                "final_rank": snap["final_rank"],
-                "tier": snap["tier"],
-                "size": snap["size"],
-                "entry_close": entry_close,
-            }
-
-            for h in self.cfg.runner.forward_bars:
-                exit_close = float(d["Close"].iloc[end_loc + h])
-                raw_ret = exit_close / entry_close - 1.0
-                strat_ret = raw_ret * snap["size"] if trade == "LONG" else 0.0
-                out[f"ret_{h}"] = raw_ret
-                out[f"strat_ret_{h}"] = strat_ret
-
-            rows.append(out)
-
-        return pd.DataFrame(rows)
-
-    @staticmethod
-    def summarize(trades: pd.DataFrame, horizons: Tuple[int, ...]) -> pd.DataFrame:
-        if trades.empty:
-            return pd.DataFrame()
-
-        rows = []
-        active = trades[trades["signal"] == "LONG"].copy()
-
-        for h in horizons:
-            col = f"strat_ret_{h}"
-            if col not in active.columns or active.empty:
-                continue
-
-            eq = (1.0 + active[col].fillna(0.0)).cumprod()
-            peak = eq.cummax()
-            dd = eq / peak - 1.0
-
-            rows.append({
-                "horizon": h,
-                "signals": int(len(active)),
-                "avg_return": float(active[col].mean()),
-                "median_return": float(active[col].median()),
-                "hit_rate": float((active[col] > 0).mean()),
-                "cum_return": float(eq.iloc[-1] - 1.0) if len(eq) else np.nan,
-                "max_drawdown": float(dd.min()) if len(dd) else np.nan,
-            })
-
-        return pd.DataFrame(rows)
-
-
-# =========================================================
-# I/O scaffold
-# =========================================================
-def load_csv_ohlcv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
+def load_csv_ohlcv(uploaded_file) -> pd.DataFrame:
+    df = pd.read_csv(uploaded_file)
     cols = {c.lower(): c for c in df.columns}
     required = ["date", "open", "high", "low", "close"]
     missing = [c for c in required if c not in cols]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    rename_map = {cols["date"]: "Date", cols["open"]: "Open", cols["high"]: "High", cols["low"]: "Low", cols["close"]: "Close"}
+    rename_map = {
+        cols["date"]: "Date",
+        cols["open"]: "Open",
+        cols["high"]: "High",
+        cols["low"]: "Low",
+        cols["close"]: "Close",
+    }
     if "volume" in cols:
         rename_map[cols["volume"]] = "Volume"
 
@@ -610,32 +287,153 @@ def load_csv_ohlcv(path: str) -> pd.DataFrame:
     return df[["Open", "High", "Low", "Close", "Volume"]].copy()
 
 
-def run_single_file(csv_path: str, symbol: str, outdir: str = "v4_results") -> Dict[str, str]:
-    cfg = V4Config()
-    bt = BacktestEngine(cfg)
-    df = load_csv_ohlcv(csv_path)
+def analyze_latest(df: pd.DataFrame, cfg: V4Config):
+    feat = FeatureEngine(cfg)
+    sig = SignalEngine(cfg)
 
-    tactical_trades = bt.run_tactical_walk_forward(df, symbol)
-    runner_trades = bt.run_runner_walk_forward(df, symbol)
+    d = feat.enrich(df)
+    end_loc = len(d) - 1
+    base = feat.detect_base(d, end_loc)
+    if not base:
+        return None
 
-    tactical_summary = bt.summarize(tactical_trades, cfg.tactical.forward_bars)
-    runner_summary = bt.summarize(runner_trades, cfg.runner.forward_bars)
+    seg = d.loc[base["start_idx"]:base["end_idx"]].copy()
+    zone = feat.estimate_avg_zone(seg)
+    d["AVWAP"] = feat.anchored_vwap(d, base["start_idx"])
+    row = d.iloc[end_loc]
+    avwap_value = d["AVWAP"].iloc[end_loc]
 
-    out = Path(outdir)
-    out.mkdir(parents=True, exist_ok=True)
+    setup_score = sig.setup_score(base)
+    confirmation_score = sig.confirmation_score(row, base, zone, avwap_value)
+    hold_score = sig.hold_score(row, zone, avwap_value)
+    regime_score = sig.regime_score(row, zone)
+    confidence = normalize_score(0.25 * setup_score + 0.35 * confirmation_score + 0.25 * hold_score + 0.15 * regime_score)
+    final_rank = sig.final_rank(setup_score, confirmation_score, hold_score, regime_score)
+    tier = sig.tier(final_rank)
 
-    tactical_trades.to_csv(out / f"{symbol}_tactical_trades.csv", index=False)
-    runner_trades.to_csv(out / f"{symbol}_runner_trades.csv", index=False)
-    tactical_summary.to_csv(out / f"{symbol}_tactical_summary.csv", index=False)
-    runner_summary.to_csv(out / f"{symbol}_runner_summary.csv", index=False)
+    tactical_ok = (
+        row["Close"] > base["base_high"]
+        and row["Close"] > zone["avg_core"]
+        and pd.notna(avwap_value)
+        and row["Close"] > avwap_value
+        and confidence >= cfg.tactical.min_confidence
+        and final_rank >= cfg.tactical.min_rank
+    )
+
+    runner_ok = (
+        tactical_ok
+        and row["weekly_state"] == "bullish"
+        and confidence >= cfg.runner.min_confidence
+        and final_rank >= cfg.runner.min_rank
+    )
 
     return {
-        "tactical_trades": str(out / f"{symbol}_tactical_trades.csv"),
-        "runner_trades": str(out / f"{symbol}_runner_trades.csv"),
-        "tactical_summary": str(out / f"{symbol}_tactical_summary.csv"),
-        "runner_summary": str(out / f"{symbol}_runner_summary.csv"),
+        "data": d,
+        "base": base,
+        "zone": zone,
+        "avwap_value": avwap_value,
+        "setup_score": setup_score,
+        "confirmation_score": confirmation_score,
+        "hold_score": hold_score,
+        "regime_score": regime_score,
+        "confidence": confidence,
+        "final_rank": final_rank,
+        "tier": tier,
+        "tactical_signal": "LONG" if tactical_ok else "FLAT",
+        "runner_signal": "LONG" if runner_ok else "FLAT",
     }
 
 
-if __name__ == "__main__":
-    print("V4 core lane skeleton ready. Use run_single_file(csv_path, symbol).")
+st.title("V4 Core Lane App")
+st.caption("Sekarang ada isi. Upload CSV OHLCV lalu app bakal baca structure V4 buat latest bar.")
+
+with st.sidebar:
+    st.header("Config")
+    symbol = st.text_input("Symbol label", value="AAPL")
+    uploaded = st.file_uploader("Upload CSV OHLCV", type=["csv"])
+    st.markdown("CSV minimal:")
+    st.code("Date,Open,High,Low,Close,Volume", language=None)
+
+cfg = V4Config()
+
+if uploaded is None:
+    st.info("Upload CSV dulu. File yang kemarin kosong karena yang dideploy itu module skeleton, bukan UI Streamlit.")
+else:
+    try:
+        df = load_csv_ohlcv(uploaded)
+        if len(df) < 250:
+            st.warning(f"Data cuma {len(df)} bar. Lebih bagus >= 250 bar.")
+        res = analyze_latest(df, cfg)
+        if res is None:
+            st.error("Belum ketemu base/range yang cukup jelas di latest window.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Tactical", res["tactical_signal"])
+            c2.metric("Runner", res["runner_signal"])
+            c3.metric("Confidence", f'{res["confidence"]:.1f}')
+            c4.metric("Final Rank", f'{res["final_rank"]:.1f}')
+
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("Tier", res["tier"])
+            c6.metric("Base High", f'{res["base"]["base_high"]:.4f}')
+            c7.metric("Avg Core", f'{res["zone"]["avg_core"]:.4f}')
+            c8.metric("AVWAP", f'{res["avwap_value"]:.4f}' if pd.notna(res["avwap_value"]) else "NA")
+
+            st.subheader(f"{symbol} Close vs AVWAP")
+            chart_df = res["data"][["Close", "AVWAP"]].copy()
+            st.line_chart(chart_df)
+
+            st.subheader("Scores")
+            score_df = pd.DataFrame(
+                [
+                    ["Setup Score", round(res["setup_score"], 2)],
+                    ["Confirmation Score", round(res["confirmation_score"], 2)],
+                    ["Hold Score", round(res["hold_score"], 2)],
+                    ["Regime Score", round(res["regime_score"], 2)],
+                    ["Confidence", round(res["confidence"], 2)],
+                    ["Final Rank", round(res["final_rank"], 2)],
+                ],
+                columns=["Metric", "Value"],
+            )
+            st.dataframe(score_df, use_container_width=True, hide_index=True)
+
+            st.subheader("Base / Zone Info")
+            base_df = pd.DataFrame(
+                [
+                    ["Base Start", str(res["base"]["start_idx"])],
+                    ["Base End", str(res["base"]["end_idx"])],
+                    ["Base Low", round(res["base"]["base_low"], 4)],
+                    ["Base High", round(res["base"]["base_high"], 4)],
+                    ["Compression", round(res["base"]["compression"], 4)],
+                    ["Low Tests", int(res["base"]["low_tests"])],
+                    ["High Tests", int(res["base"]["high_tests"])],
+                    ["Avg Lower", round(res["zone"]["avg_lower"], 4)],
+                    ["Avg Core", round(res["zone"]["avg_core"], 4)],
+                    ["Avg Upper", round(res["zone"]["avg_upper"], 4)],
+                    ["Defend Low", round(res["zone"]["defend_low"], 4)],
+                    ["Defend High", round(res["zone"]["defend_high"], 4)],
+                ],
+                columns=["Field", "Value"],
+            )
+            st.dataframe(base_df, use_container_width=True, hide_index=True)
+
+            st.subheader("Interpretation")
+            notes = []
+            if res["tactical_signal"] == "LONG":
+                notes.append("- Tactical long valid: latest close lolos setup + confirmation minimum.")
+            else:
+                notes.append("- Tactical long belum valid: masih kurang di breakout / avg core / AVWAP / score.")
+            if res["runner_signal"] == "LONG":
+                notes.append("- Runner long valid: structure cukup kuat untuk horizon panjang.")
+            else:
+                notes.append("- Runner long belum valid: HTF / confidence / final rank belum cukup.")
+            if res["data"]["weekly_state"].iloc[-1] == "bullish":
+                notes.append("- Weekly state bullish.")
+            else:
+                notes.append(f"- Weekly state sekarang {res['data']['weekly_state'].iloc[-1]}.")
+            st.markdown("\n".join(notes))
+
+            with st.expander("Raw latest rows"):
+                st.dataframe(res["data"].tail(30), use_container_width=True)
+    except Exception as e:
+        st.error(f"Error: {e}")
