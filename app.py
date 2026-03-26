@@ -1,21 +1,10 @@
 """
-V4 Core Lane Skeleton
-Institutional-leaning long-only research engine for:
-- Tactical module (10 / 20 bars)
-- Runner module (40 / 60 / 120 bars)
-
-Focus:
-- US trend leaders + gold
-- setup -> confirmation -> hold/failure
-- adaptive sizing
-- walk-forward backtest scaffold
-
-This is a research skeleton, intended to be extended and calibrated.
+V4 Core Lane Skeleton (fixed)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -55,8 +44,8 @@ class RunnerConfig:
 
 @dataclass
 class V4Config:
-    tactical: TacticalConfig = TacticalConfig()
-    runner: RunnerConfig = RunnerConfig()
+    tactical: TacticalConfig = field(default_factory=TacticalConfig)
+    runner: RunnerConfig = field(default_factory=RunnerConfig)
     base_lookback: int = 150
     base_min_len: int = 20
     base_max_len: int = 70
@@ -113,7 +102,6 @@ def weekly_trend_state(df: pd.DataFrame, fast_ma: int = 20, slow_ma: int = 40) -
     state.loc[bear] = "bearish"
     state = state.fillna("neutral")
 
-    # Align back to daily
     aligned = state.reindex(df.index, method="ffill")
     return aligned.fillna("neutral")
 
@@ -491,9 +479,8 @@ class BacktestEngine:
                 final_rank=snap["final_rank"],
             )
 
-            if not signal or self.risk.no_trade_filter(snap["confidence"], snap["final_rank"], row["weekly_state"]):
-                trade = "FLAT"
-            else:
+            trade = "FLAT"
+            if signal and not self.risk.no_trade_filter(snap["confidence"], snap["final_rank"], row["weekly_state"]):
                 trade = "LONG"
 
             entry_close = float(d["Close"].iloc[end_loc])
@@ -541,9 +528,8 @@ class BacktestEngine:
                 final_rank=snap["final_rank"],
             )
 
-            if not signal or self.risk.no_trade_filter(snap["confidence"], snap["final_rank"], row["weekly_state"]):
-                trade = "FLAT"
-            else:
+            trade = "FLAT"
+            if signal and not self.risk.no_trade_filter(snap["confidence"], snap["final_rank"], row["weekly_state"]):
                 trade = "LONG"
 
             entry_close = float(d["Close"].iloc[end_loc])
